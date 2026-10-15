@@ -1,18 +1,21 @@
 """Poll the Aiven blog RSS feed and post new entries to a subreddit.
 
-State (already-posted URLs) lives in Valkey so restarts/redeploys don't repost.
+No database: Reddit itself is the state. Before posting, the app reads the
+subreddit's recent submissions and skips any blog URL already there. Reddit's own
+duplicate-link check is a second safety net.
 
-Env vars:
-  VALKEY_URL            injected by the Aiven Valkey service integration
-  REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET / REDDIT_USERNAME / REDDIT_PASSWORD  (secrets)
-  FEED_URL              default https://aiven.io/blog/feed.xml
-  SUBREDDIT             default aiven_ip
-  POLL_SECONDS          default 1800
-  INITIAL_POST_COUNT    on the very first run, post the N most recent entries and mark
-                        the rest as seen (default 0 = seed silently). Use e.g. 3 to test.
-  DRY_RUN               "true" = log what would be posted, post nothing, save no state
-  PORT                  health endpoint port, default 8080
+Env vars (Reddit ones are secrets):
+  REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET / REDDIT_USERNAME / REDDIT_PASSWORD
+  FEED_URL        default https://aiven.io/blog/feed.xml
+  SUBREDDIT       default aiven_ip
+  POLL_SECONDS    default 1800
+  LOOKBACK_DAYS   only consider blogs published in the last N days (default 3).
+                  Raise it (e.g. 60) to test with older blogs.
+  MAX_PER_RUN     max posts per poll (default 3)
+  DRY_RUN         "true" = log what would be posted, post nothing
+  PORT            health endpoint port, default 8080
 """
+import calendar
 import logging
 import os
 import threading
@@ -21,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import feedparser
 import praw
-import redis
+from praw.exceptions import RedditAPIException
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("blog2reddit")
@@ -29,12 +32,10 @@ log = logging.getLogger("blog2reddit")
 FEED_URL = os.getenv("FEED_URL", "https://aiven.io/blog/feed.xml")
 SUBREDDIT = os.getenv("SUBREDDIT", "aiven_ip")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "1800"))
-INITIAL_POST_COUNT = int(os.getenv("INITIAL_POST_COUNT", "0"))
+LOOKBACK_DAYS = float(os.getenv("LOOKBACK_DAYS", "3"))
+MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "3"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 PORT = int(os.getenv("PORT", "8080"))
-
-SEEN_KEY = "blog2reddit:seen"
-SEEDED_KEY = "blog2reddit:seeded"
 
 
 class Health(BaseHTTPRequestHandler):
@@ -61,54 +62,55 @@ def reddit_client():
     )
 
 
-def submit(reddit, entry):
-    if DRY_RUN:
-        log.info("[dry-run] would post: %s -> %s", entry.title, entry.link)
-        return True
-    try:
-        reddit.subreddit(SUBREDDIT).submit(title=entry.title, url=entry.link)
-        log.info("posted: %s", entry.title)
-        return True
-    except Exception:
-        log.exception("failed to post %s", entry.link)
-        return False
+def norm(url):
+    return (url or "").split("?")[0].rstrip("/").lower()
 
 
-def poll_once(r, reddit):
+def already_posted(sub):
+    return {norm(s.url) for s in sub.new(limit=200)}
+
+
+def published_ts(entry):
+    t = entry.get("published_parsed")
+    return calendar.timegm(t) if t else 0
+
+
+def poll_once(reddit):
     feed = feedparser.parse(FEED_URL)
-    if feed.bozo and not feed.entries:
+    if not feed.entries:
         log.warning("feed fetch/parse failed: %s", feed.get("bozo_exception"))
         return
-    entries = list(feed.entries)  # newest first
+    cutoff = time.time() - LOOKBACK_DAYS * 86400
+    sub = reddit.subreddit(SUBREDDIT)
+    posted = already_posted(sub)
 
-    if not r.exists(SEEDED_KEY):
-        to_post = entries[:INITIAL_POST_COUNT]
-        to_seed = entries[INITIAL_POST_COUNT:]
-        log.info("first run: posting %d, silently seeding %d", len(to_post), len(to_seed))
-        if not DRY_RUN:
-            if to_seed:
-                r.sadd(SEEN_KEY, *[e.link for e in to_seed])
-            r.set(SEEDED_KEY, "1")
-        for e in reversed(to_post):  # oldest first
-            if submit(reddit, e) and not DRY_RUN:
-                r.sadd(SEEN_KEY, e.link)
-        return
+    candidates = [
+        e for e in feed.entries
+        if published_ts(e) >= cutoff and norm(e.link) not in posted
+    ]
+    candidates.sort(key=published_ts)  # oldest first
+    log.info("%d candidate(s); posting up to %d", len(candidates), MAX_PER_RUN)
 
-    new = [e for e in entries if not r.sismember(SEEN_KEY, e.link)]
-    log.info("%d new entries", len(new))
-    for e in reversed(new):  # oldest first
-        if submit(reddit, e) and not DRY_RUN:
-            r.sadd(SEEN_KEY, e.link)
-        time.sleep(10)  # be gentle with Reddit rate limits
+    for e in candidates[:MAX_PER_RUN]:
+        if DRY_RUN:
+            log.info("[dry-run] would post: %s -> %s", e.title, e.link)
+            continue
+        try:
+            sub.submit(title=e.title, url=e.link, resubmit=False)
+            log.info("posted: %s", e.title)
+        except RedditAPIException as ex:
+            log.warning("reddit rejected %s: %s", e.link, ex)
+        except Exception:
+            log.exception("failed to post %s", e.link)
+        time.sleep(10)
 
 
 def main():
     threading.Thread(target=serve_health, daemon=True).start()
-    r = redis.from_url(os.environ["VALKEY_URL"], decode_responses=True)
-    reddit = None if DRY_RUN else reddit_client()
+    reddit = reddit_client()
     while True:
         try:
-            poll_once(r, reddit)
+            poll_once(reddit)
         except Exception:
             log.exception("poll failed")
         time.sleep(POLL_SECONDS)
