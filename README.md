@@ -1,14 +1,15 @@
 # aiven-blog-to-reddit
 
-Polls https://aiven.io/blog/feed.xml and posts new blogs to r/aiven_ip. Runs as a single container on Aiven Runtime. No database: the subreddit itself is the dedupe state (it skips any blog URL already posted there).
+Semi-automatic helper for sharing new Aiven blogs on r/aiven_io. Needs no Reddit API access.
+
+Runs as one container on Aiven Runtime. It polls https://aiven.io/blog/feed.xml and serves a page at the app's public URL listing recent blogs, each with a pre-filled "Submit to r/aiven_io" link. Click it, press Submit on Reddit. Blogs already in the subreddit show as "posted" (detected from the subreddit's public RSS).
+
+Optional: set `SLACK_WEBHOOK_URL` (as a Secret) to get a Slack ping with the submit link for each new blog.
 
 ## Deploy
-1. Push this repo to GitHub.
-2. Aiven Console > Runtime > Deploy application, port 8080.
-3. In the app's Environment variables, add as **Secret**: `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USERNAME`, `REDDIT_PASSWORD`.
+Aiven Console > Runtime > Deploy application from this repo, port 8080. Env vars: `SUBREDDIT` (default `aiven_io`), `POLL_SECONDS`, `LOOKBACK_DAYS`, `SLACK_WEBHOOK_URL`, `SHOW_COUNT`.
 
-## Testing with older blogs
-Set `LOOKBACK_DAYS=60` and `MAX_PER_RUN=3` (posts the 3 oldest unposted blogs in the window per poll). Add `DRY_RUN=true` to only log. For production use `LOOKBACK_DAYS=3`.
-
-## Reddit app
-Create a "script" app at https://www.reddit.com/prefs/apps with a dedicated bot account that can post in r/aiven_ip.
+## Notes
+- The page is public and only lists public blog titles.
+- Slack dedupe is in memory, so a restart may re-ping blogs from the last `LOOKBACK_DAYS` days.
+- If Reddit blocks the RSS check from the cloud IP, the page warns that posted status is unknown.
