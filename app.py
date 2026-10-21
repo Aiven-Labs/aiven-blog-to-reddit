@@ -101,6 +101,9 @@ def poll_once():
     with lock:
         state.update(entries=entries, posted=posted, reddit_ok=ok, checked=time.time())
     cutoff = time.time() - LOOKBACK_DAYS * 86400
+    with lock:
+        global _last_refresh
+        _last_refresh = time.time()
     for e in reversed(entries):  # oldest first
         if ts(e) >= cutoff and norm(e.link) not in posted and e.link not in notified:
             notified.add(e.link)
@@ -117,7 +120,25 @@ def poll_loop():
         time.sleep(POLL_SECONDS)
 
 
+REFRESH_TTL = 60  # seconds: page loads re-check the subreddit at most this often
+_last_refresh = 0.0
+
+
+def refresh_posted():
+    """Re-check which blogs are already in the subreddit (cheap; called on page load)."""
+    global _last_refresh
+    with lock:
+        entries = list(state["entries"])
+        if not entries or time.time() - _last_refresh < REFRESH_TTL:
+            return
+        _last_refresh = time.time()
+    posted, ok = posted_in_subreddit(entries)
+    with lock:
+        state.update(posted=posted, reddit_ok=ok, checked=time.time())
+
+
 def render():
+    refresh_posted()
     with lock:
         entries, posted, ok, checked = (
             list(state["entries"]), set(state["posted"]), state["reddit_ok"], state["checked"],
