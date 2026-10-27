@@ -39,7 +39,7 @@ SHOW_COUNT = int(os.getenv("SHOW_COUNT", "25"))
 PORT = int(os.getenv("PORT", "8080"))
 UA = "aiven-blog-helper/1.0 (feed reader; contact hugh.evans@aiven.io)"
 
-state = {"entries": [], "posted": set(), "reddit_ok": None, "checked": None}
+state = {"entries": [], "posted": {}, "reddit_ok": None, "checked": None}
 notified = set()  # in memory: a restart can re-ping recent blogs, which is harmless
 lock = threading.Lock()
 
@@ -61,17 +61,40 @@ def submit_url(entry):
 def fetch_text(url):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=20) as r:
-        return r.read().decode("utf-8", "replace").lower()
+        return r.read().decode("utf-8", "replace")
 
 
 def posted_in_subreddit(entries):
-    """Return (set_of_normalised_urls_found, ok_flag) using the subreddit's public RSS."""
+    """Return ({normalised blog url: (unix_ts, reddit_permalink)}, ok_flag).
+
+    Uses the subreddit's public RSS. Each Reddit entry carries its posted time and its
+    permalink; the blog URL it points to is inside the entry content.
+    """
     try:
         body = fetch_text(f"https://www.reddit.com/r/{SUBREDDIT}/new/.rss?limit=100")
     except Exception as ex:
         log.warning("could not read r/%s RSS (%s); posted-status unknown", SUBREDDIT, ex)
-        return set(), False
-    return {norm(e.link) for e in entries if norm(e.link) in body}, True
+        return {}, False
+    wanted = {norm(e.link): e.link for e in entries}
+    found = {}
+    for r in feedparser.parse(body).entries:
+        content = html.unescape(
+            " ".join(c.get("value", "") for c in r.get("content", [])) + " " + r.get("summary", "")
+        ).lower()
+        when = calendar.timegm(r.published_parsed) if r.get("published_parsed") else 0
+        for n in wanted:
+            if n in content and (n not in found or when < found[n][0]):
+                found[n] = (when, r.get("link", ""))
+    return found, True
+
+
+def ago(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
 
 
 def slack(entry):
@@ -141,13 +164,20 @@ def render():
     refresh_posted()
     with lock:
         entries, posted, ok, checked = (
-            list(state["entries"]), set(state["posted"]), state["reddit_ok"], state["checked"],
+            list(state["entries"]), dict(state["posted"]), state["reddit_ok"], state["checked"],
         )
+    now = time.time()
     rows = []
     for e in entries:
-        done = norm(e.link) in posted
-        if done:
-            action = "<span class='done'>posted</span>"
+        info = posted.get(norm(e.link))
+        if info:
+            when, permalink = info
+            stamp = time.strftime("%a %d %b %H:%M UTC", time.gmtime(when)) if when else "time unknown"
+            rel = f" ({ago(now - when)})" if when else ""
+            label = f"posted {html.escape(stamp)}{rel}"
+            if permalink:
+                label = f"<a href='{html.escape(permalink)}' target='_blank' rel='noopener'>{label}</a>"
+            action = f"<span class='done'>{label}</span>"
         else:
             action = f"<a class='btn' target='_blank' rel='noopener' href='{html.escape(submit_url(e))}'>Submit to r/{html.escape(SUBREDDIT)}</a>"
         date = time.strftime("%Y-%m-%d", time.gmtime(ts(e))) if ts(e) else ""
@@ -158,13 +188,23 @@ def render():
     if ok is False:
         note = "<p class='warn'>Couldn't read the subreddit, so posted status may be wrong. Check Reddit before submitting.</p>"
     when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(checked)) if checked else "not yet"
+    times = [w for w, _ in posted.values() if w]
+    if times:
+        n24 = sum(1 for w in times if now - w < 86400)
+        n7 = sum(1 for w in times if now - w < 7 * 86400)
+        pace = (
+            f"<p class='pace'>Pacing: last blog post {ago(now - max(times))} &middot; "
+            f"{n24} in the last 24h &middot; {n7} in the last 7 days.</p>"
+        )
+    else:
+        pace = "<p class='pace'>Pacing: no blog posts found in the subreddit yet.</p>"
     return f"""<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Aiven blog to r/{html.escape(SUBREDDIT)}</title>
 <style>body{{font:15px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem}}table{{border-collapse:collapse;width:100%}}
 td{{padding:.5rem;border-bottom:1px solid #ddd}}.btn{{background:#ff4500;color:#fff;padding:.3rem .7rem;border-radius:4px;text-decoration:none;white-space:nowrap}}
-.done{{color:#2a7}}.warn{{color:#b60}}</style>
+.done{{color:#2a7}}.done a{{color:inherit}}.warn{{color:#b60}}.pace{{font-weight:600}}</style>
 <h1>Aiven blog to r/{html.escape(SUBREDDIT)}</h1>
-<p>Click a button, then press Submit on Reddit. Last checked: {when}.</p>{note}
+<p>Click a button, then press Submit on Reddit. Last checked: {when}.</p>{pace}{note}
 <table>{''.join(rows) or '<tr><td>Loading feed...</td></tr>'}</table>"""
 
 
