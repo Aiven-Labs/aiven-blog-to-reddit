@@ -21,6 +21,7 @@ import logging
 import os
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlencode
@@ -37,9 +38,11 @@ LOOKBACK_DAYS = float(os.getenv("LOOKBACK_DAYS", "3"))
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 SHOW_COUNT = int(os.getenv("SHOW_COUNT", "25"))
 PORT = int(os.getenv("PORT", "8080"))
-UA = "aiven-blog-helper/1.0 (feed reader; contact hugh.evans@aiven.io)"
+# Reddit asks for a descriptive UA naming the app and a Reddit username (no email needed).
+UA = os.getenv("USER_AGENT", "python:aiven-blog-helper:1.0 (by /u/HughEvansDev)")
+STATE_FILE = os.getenv("STATE_FILE", "/tmp/posted.json")
 
-state = {"entries": [], "posted": {}, "reddit_ok": None, "checked": None}
+state = {"entries": [], "posted": {}, "reddit_ok": None, "checked": None, "reddit_last_ok": None}
 notified = set()  # in memory: a restart can re-ping recent blogs, which is harmless
 lock = threading.Lock()
 
@@ -58,26 +61,73 @@ def submit_url(entry):
     return f"https://www.reddit.com/r/{SUBREDDIT}/submit?{q}"
 
 
-def fetch_text(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return r.read().decode("utf-8", "replace")
+def fetch_text(url, attempts=3):
+    """GET with retries: Reddit throttles unauthenticated requests (429) from time to time."""
+    last = None
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as ex:
+            last = ex
+            if ex.code not in (429, 500, 502, 503, 504):
+                break
+        except Exception as ex:  # network hiccup
+            last = ex
+        time.sleep(2 * (i + 1))
+    raise last
+
+
+def reddit_endpoints():
+    s = SUBREDDIT
+    return [
+        f"https://www.reddit.com/r/{s}/new/.rss?limit=100",
+        f"https://www.reddit.com/r/{s}/search.rss?q=aiven.io&restrict_sr=1&sort=new&limit=100",
+        f"https://old.reddit.com/r/{s}/new/.rss?limit=100",
+    ]
+
+
+def load_saved():
+    try:
+        with open(STATE_FILE) as f:
+            return {k: tuple(v) for k, v in json.load(f).items()}
+    except Exception:
+        return {}
+
+
+def save_posted(posted):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(posted, f)
+    except Exception:
+        pass
 
 
 def posted_in_subreddit(entries):
     """Return ({normalised blog url: (unix_ts, reddit_permalink)}, ok_flag).
 
-    Uses the subreddit's public RSS. Each Reddit entry carries its posted time and its
-    permalink; the blog URL it points to is inside the entry content.
+    Uses the subreddit's public RSS (trying a few endpoints). Each Reddit entry carries
+    its posted time and its permalink; the blog URL it points to is inside the content.
     """
-    try:
-        body = fetch_text(f"https://www.reddit.com/r/{SUBREDDIT}/new/.rss?limit=100")
-    except Exception as ex:
-        log.warning("could not read r/%s RSS (%s); posted-status unknown", SUBREDDIT, ex)
+    feed = None
+    for url in reddit_endpoints():
+        try:
+            parsed = feedparser.parse(fetch_text(url))
+        except Exception as ex:
+            log.warning("could not read %s (%s)", url, ex)
+            continue
+        if parsed.get("feed", {}).get("title", "").lower() == "not found":
+            log.warning("%s returned a Not Found feed", url)
+            continue
+        feed = parsed
+        break
+    if feed is None:
+        log.warning("all Reddit endpoints failed for r/%s; keeping last known status", SUBREDDIT)
         return {}, False
     wanted = {norm(e.link): e.link for e in entries}
     found = {}
-    for r in feedparser.parse(body).entries:
+    for r in feed.entries:
         content = html.unescape(
             " ".join(c.get("value", "") for c in r.get("content", [])) + " " + r.get("summary", "")
         ).lower()
@@ -86,6 +136,21 @@ def posted_in_subreddit(entries):
             if n in content and (n not in found or when < found[n][0]):
                 found[n] = (when, r.get("link", ""))
     return found, True
+
+
+def merge_posted(entries):
+    """Check Reddit and merge into state. A blog once seen as posted stays posted, so a
+    temporary Reddit outage never wipes known status."""
+    found, ok = posted_in_subreddit(entries)
+    with lock:
+        merged = dict(state["posted"])
+        merged.update(found)
+        state.update(posted=merged, reddit_ok=ok, checked=time.time())
+        if ok:
+            state["reddit_last_ok"] = time.time()
+    if ok and found:
+        save_posted(merged)
+    return merged
 
 
 def ago(seconds):
@@ -120,9 +185,11 @@ def poll_once():
         log.warning("feed fetch/parse failed: %s", feed.get("bozo_exception"))
         return
     entries = sorted(feed.entries, key=ts, reverse=True)[:SHOW_COUNT]
-    posted, ok = posted_in_subreddit(entries)
     with lock:
-        state.update(entries=entries, posted=posted, reddit_ok=ok, checked=time.time())
+        state.update(entries=entries)
+        if not state["posted"]:
+            state["posted"] = load_saved()
+    posted = merge_posted(entries)
     cutoff = time.time() - LOOKBACK_DAYS * 86400
     with lock:
         global _last_refresh
@@ -155,9 +222,7 @@ def refresh_posted():
         if not entries or time.time() - _last_refresh < REFRESH_TTL:
             return
         _last_refresh = time.time()
-    posted, ok = posted_in_subreddit(entries)
-    with lock:
-        state.update(posted=posted, reddit_ok=ok, checked=time.time())
+    merge_posted(entries)
 
 
 def render():
@@ -186,7 +251,13 @@ def render():
         )
     note = ""
     if ok is False:
-        note = "<p class='warn'>Couldn't read the subreddit, so posted status may be wrong. Check Reddit before submitting.</p>"
+        last_ok = state.get("reddit_last_ok")
+        since = f"Showing last known status (Reddit last read {ago(now - last_ok)})." if last_ok else "No status known yet."
+        note = (
+            "<p class='warn'>Reddit is not letting this app read r/" + html.escape(SUBREDDIT)
+            + " right now (it throttles automated requests), so posted status may be out of date. "
+            + since + " Check the subreddit before submitting.</p>"
+        )
     when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(checked)) if checked else "not yet"
     times = [w for w, _ in posted.values() if w]
     if times:
@@ -196,6 +267,8 @@ def render():
             f"<p class='pace'>Pacing: last blog post {ago(now - max(times))} &middot; "
             f"{n24} in the last 24h &middot; {n7} in the last 7 days.</p>"
         )
+    elif ok is False:
+        pace = "<p class='pace'>Pacing: unavailable until Reddit can be read.</p>"
     else:
         pace = "<p class='pace'>Pacing: no blog posts found in the subreddit yet.</p>"
     return f"""<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
